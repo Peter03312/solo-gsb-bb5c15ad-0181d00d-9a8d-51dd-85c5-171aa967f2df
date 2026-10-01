@@ -1374,6 +1374,323 @@ app.post('/api/merge/commit', (req, res) => {
   });
 });
 
+/* ----------------------- 共享排演房间（凭房间码同步观看） ----------------------- */
+// 房间基于一个已发布版本创建并固定该版本快照：服务端保存播放/暂停、基准时码、速度与修订号，
+// 按挂钟时间推算当前时码，到版本末尾自动停住；页面刷新、服务重启、观看者重连均恢复同一进度。
+// 后续草稿修改与新版本发布不影响已有房间。持控制密钥者可播放/暂停/跳转/改速（0.5/1/2），
+// 控制请求携带修订号，过期返回 409 且不改房间。房间操作不改动版本、草稿与调光记录。
+
+const ROOM_CODE_RE = /^[2-9A-HJ-NP-Z]{6}$/;
+const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去除 0/O、1/I 等易混字符
+const ROOM_SPEEDS = new Set([0.5, 1, 2]);
+
+function newRoomCode() {
+  const buf = crypto.randomBytes(6);
+  let code = '';
+  for (let i = 0; i < 6; i++) code += ROOM_CODE_ALPHABET[buf[i] % ROOM_CODE_ALPHABET.length];
+  return code;
+}
+
+function normRoomCode(v) {
+  return typeof v === 'string' ? v.trim().toUpperCase() : '';
+}
+
+/**
+ * 由房间持久状态推算当前时码与播放态（纯计算，不写库）。
+ * 播放中：t = base_time + speed × (now - anchor_at)，到 duration 自动停住；
+ * 暂停/已到末尾：t = base_time（末尾停住时为 duration）。
+ */
+function roomCompute(row, now) {
+  now = now ?? Date.now() / 1000;
+  let { playing, base_time: base, speed, duration, at_end } = row;
+  playing = !!playing;
+  at_end = !!at_end;
+  let t = base;
+  if (playing && !at_end) {
+    t = base + speed * (now - row.anchor_at);
+    if (t >= duration) {
+      t = duration;
+      playing = false;
+      at_end = true;
+    } else if (t < 0) {
+      t = 0; // 防御：挂钟异常回拨时不为负
+    }
+  }
+  return { playing, time: t, at_end };
+}
+
+// 自动停住落库（读到播放中但已到末尾时）：冻结在末尾、暂停并推进修订号
+function roomAutoStop(row) {
+  db.prepare(
+    `UPDATE rooms SET playing = 0, base_time = ?, speed = speed, anchor_at = ?,
+                      at_end = 1, revision = revision + 1 WHERE id = ?`
+  ).run(row.duration, Date.now() / 1000, row.id);
+}
+
+function getRoomRow(code) {
+  if (!ROOM_CODE_RE.test(code)) return null;
+  return db.prepare('SELECT * FROM rooms WHERE code = ?').get(code) || null;
+}
+
+/**
+ * 房间对外状态。includeKey 仅在创建响应中使用；控制操作的响应携带 version 快照供前端直接渲染。
+ * server_now/server_time/speed 供观看端校时：client 据此把本地挂钟对齐到服务端基准。
+ */
+function presentRoom(row, { includeKey = false } = {}) {
+  const now = Date.now() / 1000;
+  const c = roomCompute(row, now);
+  const out = {
+    code: row.code,
+    version: { id: row.version_id },
+    duration: round6(row.duration),
+    playing: c.playing,
+    paused: !c.playing,
+    at_end: c.at_end,
+    time: round6(c.time),
+    base_time: round6(row.base_time),
+    speed: row.speed,
+    anchor_at: row.anchor_at,
+    server_now: round6(now),
+    revision: row.revision,
+    created_at: row.created_at,
+  };
+  if (includeKey) out.control_key = row.control_key;
+  return out;
+}
+
+app.post('/api/rooms', (req, res) => {
+  const versionId = toPosInt(req.body?.version_id);
+  if (Number.isNaN(versionId)) {
+    return err(res, 400, `版本编号无效：${JSON.stringify(req.body?.version_id)}（须为已发布版本的正整数编号）`);
+  }
+  const version = db.prepare('SELECT id, label FROM versions WHERE id = ?').get(versionId);
+  if (!version) return err(res, 404, `版本不存在：#${versionId}，无法基于它创建共享房间`);
+
+  const snap = loadVersionSnapshot(versionId);
+  const duration = Engine.showDuration(Engine.prepareCues(snap.cues));
+  const key = crypto.randomBytes(24).toString('hex');
+  const now = Date.now() / 1000;
+
+  // 房间码极小概率撞号时重试几次
+  let code;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    code = newRoomCode();
+    try {
+      db.prepare(
+        `INSERT INTO rooms
+           (code, control_key, version_id, duration, playing, base_time, speed, anchor_at, at_end, revision, created_at)
+         VALUES (?, ?, ?, ?, 0, 0, 1, ?, ?, 0, ?)`
+      ).run(code, key, versionId, duration, now, duration === 0 ? 1 : 0, now);
+      const row = getRoomRow(code);
+      const body = presentRoom(row, { includeKey: true });
+      body.version.label = version.label;
+      return res.status(201).json(body);
+    } catch (e) {
+      if (!String(e.message).includes('UNIQUE')) throw e;
+    }
+  }
+  return err(res, 500, '房间码分配失败，请重试');
+});
+
+app.get('/api/rooms', (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT r.*, v.label AS version_label
+       FROM rooms r JOIN versions v ON v.id = r.version_id
+       ORDER BY r.id DESC`
+    )
+    .all();
+  res.json(
+    rows.map((row) => {
+      // 列表不触发自动停住落库，避免只读列表产生副作用；详情接口会负责落库
+      const now = Date.now() / 1000;
+      const c = roomCompute(row, now);
+      return {
+        code: row.code,
+        version_id: row.version_id,
+        version_label: row.version_label,
+        duration: round6(row.duration),
+        playing: c.playing,
+        at_end: c.at_end,
+        time: round6(c.time),
+        speed: row.speed,
+        revision: row.revision,
+        created_at: row.created_at,
+      };
+    })
+  );
+});
+
+// 房间详情（凭房间码观看；任何人可加入，控制密钥不返回）
+app.get('/api/rooms/:code', (req, res) => {
+  const code = normRoomCode(req.params.code);
+  if (!ROOM_CODE_RE.test(code)) {
+    return err(res, 404, `房间码无效：${JSON.stringify(req.params.code)}（须为 6 位房间码）`);
+  }
+  const row = getRoomRow(code);
+  if (!row) return err(res, 404, `房间不存在：${code}（请向创建者核对房间码）`);
+
+  // 播放中已到末尾：服务端负责把它停住在末尾（修订号 +1）
+  if (row.playing && !row.at_end) {
+    const c = roomCompute(row);
+    if (c.at_end) roomAutoStop(row);
+  }
+  const fresh = getRoomRow(code);
+  const body = presentRoom(fresh);
+  const version = db.prepare('SELECT label FROM versions WHERE id = ?').get(fresh.version_id);
+  body.version.label = version.label;
+
+  // 加入时可携带密钥核对身份：密钥正确返回 controllable=true；显式携带但错误则 403
+  const keyParam = typeof req.query.key === 'string' ? req.query.key : '';
+  if (keyParam !== '') {
+    if (keyParam !== fresh.control_key) {
+      return err(res, 403, '控制密钥无效：可留空以观看者身份加入，或向创建者核对密钥');
+    }
+    body.controllable = true;
+  } else {
+    body.controllable = false;
+  }
+
+  // 附带固定版本快照（与 /api/versions/:id 同构），观看端加入即可本地重算逐灯亮度
+  const snap = loadVersionSnapshot(fresh.version_id);
+  body.snapshot = {
+    lights: snap.lights,
+    cues: snap.cues,
+    circuits: snap.circuits,
+    wiring: snap.wiring,
+    cue_count: snap.cue_count,
+    label: snap.label,
+  };
+  res.json(body);
+});
+
+// 持密钥控制房间：播放 / 暂停 / 跳转 / 改速；携带修订号做乐观并发
+app.post('/api/rooms/:code/control', (req, res) => {
+  const code = normRoomCode(req.params.code);
+  if (!ROOM_CODE_RE.test(code)) {
+    return err(res, 404, `房间码无效：${JSON.stringify(req.params.code)}（须为 6 位房间码）`);
+  }
+  const row = getRoomRow(code);
+  if (!row) return err(res, 404, `房间不存在：${code}`);
+
+  const key = typeof req.body?.key === 'string' ? req.body.key : '';
+  if (!key || key !== row.control_key) {
+    return err(res, 403, '控制密钥无效或缺失：只有房间创建者（持密钥者）可以控制播放');
+  }
+
+  if (req.body === null || typeof req.body !== 'object' || !('revision' in req.body)) {
+    return err(res, 400, '控制请求必须携带房间修订号 revision（与服务器当前修订号一致才生效）');
+  }
+  const clientRev = toNum(req.body.revision);
+  if (!Number.isInteger(clientRev) || clientRev < 0) {
+    return err(res, 400, `修订号无效：${JSON.stringify(req.body.revision)}（须为非负整数）`);
+  }
+
+  const action = req.body.action;
+  const allowed = ['play', 'pause', 'seek', 'speed'];
+  if (!allowed.includes(action)) {
+    return err(
+      res,
+      400,
+      `非法控制动作：${JSON.stringify(action)}（须为 play 播放 / pause 暂停 / seek 跳转 / speed 设置速度 之一）`
+    );
+  }
+
+  // 先把“播放中但已到末尾”落库，得到当前权威状态与修订号
+  let cur = row;
+  if (row.playing && !row.at_end && roomCompute(row).at_end) {
+    roomAutoStop(row);
+    cur = getRoomRow(code);
+  }
+  if (clientRev !== cur.revision) {
+    return err(
+      res,
+      409,
+      `修订号冲突：提交基于修订号 ${clientRev}，房间当前已为修订号 ${cur.revision}；` +
+        '请按服务器状态刷新后重试（本次未改动房间）'
+    );
+  }
+
+  const now = Date.now() / 1000;
+  const computed = roomCompute(cur, now);
+  let playing = computed.playing ? 1 : 0;
+  let base = computed.time;
+  let speed = cur.speed;
+  let atEnd = computed.at_end ? 1 : 0;
+
+  if (action === 'play') {
+    if (cur.duration === 0) {
+      // 零长度版本：始终停在 0（即末尾），播放不改变状态也不推进修订号
+      const body = presentRoom(getRoomRow(code));
+      body.note = '该房间固定的版本总时长为 0，无可播放内容';
+      return res.json(body);
+    }
+    if (atEnd) {
+      // 已在末尾自动停住：按播放即从头开始（与播放器既有习惯一致）
+      base = 0;
+      atEnd = 0;
+    }
+    playing = 1;
+  } else if (action === 'pause') {
+    playing = 0;
+  } else if (action === 'seek') {
+    const t = toNum(req.body.time);
+    if (Number.isNaN(t)) {
+      return err(res, 400, `非法时码：${JSON.stringify(req.body.time)}（跳转时刻须为数字）`);
+    }
+    if (t < 0) return err(res, 400, `非法时码：${t}（跳转时刻不得为负）`);
+    if (t > cur.duration) {
+      return err(res, 400, `非法时码：${t}（超出该版本末尾 ${cur.duration} 秒）`);
+    }
+    base = t;
+    playing = 0; // 跳转后暂停在目标时刻（与既有播放器拖动时间轴一致）
+    atEnd = t >= cur.duration ? 1 : 0;
+  } else if (action === 'speed') {
+    const s = toNum(req.body.speed);
+    if (Number.isNaN(s) || ![...ROOM_SPEEDS].some((x) => Math.abs(x - s) < 1e-9)) {
+      return err(res, 400, `非法速度：${JSON.stringify(req.body.speed)}（仅允许 0.5 / 1 / 2 倍速）`);
+    }
+    speed = [0.5, 1, 2].find((x) => Math.abs(x - s) < 1e-9); // 规范存储值，避免浮点字面量差异
+  }
+
+  // 乐观更新：修订号 CAS，杜绝并发请求互相覆盖（同步驱动下为双保险）
+  const info = db
+    .prepare(
+      `UPDATE rooms
+       SET playing = ?, base_time = ?, speed = ?, anchor_at = ?, at_end = ?, revision = revision + 1
+       WHERE id = ? AND revision = ?`
+    )
+    .run(playing, base, speed, now, atEnd, cur.id, clientRev);
+  if (info.changes === 0) {
+    const latest = getRoomRow(code);
+    return err(
+      res,
+      409,
+      `修订号冲突：房间当前修订号为 ${latest.revision}；请按服务器状态刷新后重试（本次未改动房间）`
+    );
+  }
+
+  res.json(presentRoom(getRoomRow(code)));
+});
+
+// 关闭房间（持密钥者；DELETE 不通用浏览器表单，密钥可放 JSON body 或 ?key=）
+app.delete('/api/rooms/:code', (req, res) => {
+  const code = normRoomCode(req.params.code);
+  if (!ROOM_CODE_RE.test(code)) {
+    return err(res, 404, `房间码无效：${JSON.stringify(req.params.code)}（须为 6 位房间码）`);
+  }
+  const row = getRoomRow(code);
+  if (!row) return err(res, 404, `房间不存在：${code}`);
+  const key =
+    (typeof req.body?.key === 'string' && req.body.key) ||
+    (typeof req.query.key === 'string' ? req.query.key : '');
+  if (!key || key !== row.control_key) {
+    return err(res, 403, '控制密钥无效或缺失：只有房间创建者（持密钥者）可以关闭房间');
+  }
+  db.prepare('DELETE FROM rooms WHERE id = ?').run(row.id);
+  res.status(204).end();
+});
+
 /* ------------------------------- 错误处理 ------------------------------ */
 
 // JSON 解析失败（如非法时码导致的畸形 JSON 之外的格式错误）

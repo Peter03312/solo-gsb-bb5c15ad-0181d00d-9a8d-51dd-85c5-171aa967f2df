@@ -11,6 +11,7 @@
     <h1>🎭 小剧场灯光 Cue 排演</h1>
     <nav class="tabs">
       <button class="tab active" data-tab="player">排演播放</button>
+      <button class="tab" data-tab="rooms">共享房间</button>
       <button class="tab" data-tab="records">调光记录</button>
       <button class="tab" data-tab="compare">版本比对</button>
       <button class="tab" data-tab="load">回路负载</button>
@@ -75,6 +76,93 @@
             </thead>
             <tbody></tbody>
           </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 共享房间 ============================ -->
+    <section id="tab-rooms" class="tab-panel">
+      <div class="card">
+        <h2>创建共享房间</h2>
+        <p class="muted">
+          基于一个<strong>已发布版本</strong>创建共享房间。创建后房间<strong>固定该版本快照</strong>，
+          你将取得<strong>控制密钥</strong>（仅本次显示，请妥善保存）；其他人凭 6 位<strong>房间码</strong>
+          加入观看同一舞台与逐灯亮度。服务端按时间推算当前时码，到版本末尾<strong>自动停住</strong>；
+          页面刷新、服务重启或观看者重连后均能恢复房间进度，后续草稿修改与新版本发布不影响本房间。
+        </p>
+        <form id="form-room-create" class="inline-form">
+          <select id="room-version" required style="min-width:16rem"></select>
+          <button class="primary" type="submit">🎟 创建共享房间</button>
+        </form>
+        <div id="room-create-error" class="error-line" hidden></div>
+      </div>
+
+      <div class="card">
+        <h2>加入房间（凭房间码观看）</h2>
+        <form id="form-room-join" class="inline-form">
+          <input type="text" id="room-join-code" maxlength="6" placeholder="6 位房间码，如：K7QP2M"
+            style="max-width:14rem;text-transform:uppercase" />
+          <input type="text" id="room-join-key" placeholder="控制密钥（仅创建者填写，观看者留空）" />
+          <button class="primary" type="submit">🚪 加入房间</button>
+        </form>
+        <div id="room-join-error" class="error-line" hidden></div>
+
+        <h3>已有房间</h3>
+        <div class="table-wrap">
+          <table id="room-table">
+            <thead><tr><th>房间码</th><th>固定版本</th><th>状态</th><th>当前时码</th><th>速度</th><th>修订号</th><th>创建时间</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="room-workspace" hidden>
+        <div class="card">
+          <div class="row" style="justify-content:space-between">
+            <h2 id="room-title" style="margin:0">房间</h2>
+            <button id="btn-room-leave">离开房间</button>
+          </div>
+          <p class="muted" id="room-meta"></p>
+          <div class="row">
+            <span class="copy-field">房间码 <code id="room-code-text"></code></span>
+            <button id="btn-copy-code">复制房间码</button>
+            <span id="room-key-area" hidden>
+              <span class="copy-field">控制密钥 <code id="room-key-text"></code></span>
+              <button id="btn-copy-key">复制密钥 / 邀请链接</button>
+            </span>
+          </div>
+          <div class="row transport">
+            <button id="btn-room-play" class="primary">▶ 播放</button>
+            <button id="btn-room-pause">⏸ 暂停</button>
+            <button id="btn-room-stop">⏹ 回到起点</button>
+            <label class="speed">速度
+              <select id="room-speed">
+                <option value="0.5">0.5×</option>
+                <option value="1">1×</option>
+                <option value="2">2×</option>
+              </select>
+            </label>
+            <span class="time-readout"><b id="room-time-current">0.0</b> / <span id="room-time-total">0.0</span> s</span>
+            <label class="jump">跳转到
+              <input id="room-jump-time" type="number" min="0" step="0.1" style="width:5.5rem" /> 秒
+            </label>
+            <button id="btn-room-jump">跳转</button>
+          </div>
+          <div class="row">
+            <input id="room-timeline" type="range" min="0" max="0" step="0.01" value="0" style="flex:1" />
+          </div>
+          <p class="muted" id="room-role-hint"></p>
+          <div id="room-control-error" class="error-line" hidden></div>
+        </div>
+
+        <div class="card">
+          <h2>舞台模拟（房间同步：当前各灯实际亮度）</h2>
+          <div id="room-stage" class="stage"></div>
+        </div>
+
+        <div class="card">
+          <h2>各灯亮度</h2>
+          <div id="room-levels" class="levels"></div>
         </div>
       </div>
     </section>

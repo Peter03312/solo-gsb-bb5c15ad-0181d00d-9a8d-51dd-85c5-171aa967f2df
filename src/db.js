@@ -105,6 +105,22 @@ CREATE TABLE IF NOT EXISTS record_ops (
 
 CREATE INDEX IF NOT EXISTS idx_record_ops ON record_ops (record_id, seq);
 
+-- 共享排演房间：基于已发布版本创建，固定版本快照；服务端按挂钟推算当前时码
+CREATE TABLE IF NOT EXISTS rooms (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  code        TEXT NOT NULL UNIQUE,        -- 6 位房间码（大写字母+数字，去除易混字符），凭码加入观看
+  control_key TEXT NOT NULL,              -- 创建者控制密钥（48 位十六进制），仅创建响应中返回一次
+  version_id  INTEGER NOT NULL REFERENCES versions(id),
+  duration    REAL NOT NULL,              -- 房间固定版本的末尾时刻（建房间时由快照 Cue 推算）
+  playing     INTEGER NOT NULL DEFAULT 0, -- 1=播放中 0=暂停
+  base_time   REAL NOT NULL DEFAULT 0,    -- 基准时码（anchor_at 时刻对应的演出秒数）
+  speed       REAL NOT NULL DEFAULT 1,    -- 播放速度：仅允许 0.5 / 1 / 2
+  anchor_at   REAL NOT NULL,              -- 状态写入时的服务器挂钟秒数（Date.now()/1000，重启后仍可推算）
+  at_end      INTEGER NOT NULL DEFAULT 0, -- 是否已到版本末尾自动停住
+  revision    INTEGER NOT NULL DEFAULT 0, -- 修订号：每次成功控制（含自动停住）+1，控制请求乐观并发
+  created_at  REAL NOT NULL
+);
+
 -- 草稿合并预览令牌：预览不写库，提交时凭令牌校验抉择并确认草稿未被改动
 CREATE TABLE IF NOT EXISTS merge_previews (
   token        TEXT PRIMARY KEY,

@@ -223,3 +223,8 @@ tr.cmp-hot td { color: var(--amber-soft); }
 .merge-choice input { margin-top: .25rem; }
 .merge-choice-label { font-weight: 600; color: var(--amber-soft); margin-bottom: .25rem; }
 .merge-warns { margin: .3rem 0 0; padding-left: 1.1rem; font-size: .8rem; }
+
+/* 共享房间 */
+.copy-field { font-size: .88rem; color: var(--muted); display: inline-flex; align-items: center; gap: .35rem; }
+.copy-field code { font-size: .95rem; letter-spacing: .06em; }
+#room-join-code { font-family: ui-monospace, Menlo, Consolas, monospace; letter-spacing: .12em; }
