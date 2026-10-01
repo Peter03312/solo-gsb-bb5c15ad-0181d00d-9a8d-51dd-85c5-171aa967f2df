@@ -196,9 +196,29 @@ tr.cmp-hot td { color: var(--amber-soft); }
 .cmp-cfg-group.only-b b { color: var(--amber); }
 .danger-text { color: var(--danger); font-weight: 600; }
 
+/* 共享房间 */
+.room-lobby-cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  gap: 1rem;
+  margin-top: .8rem;
+}
+.room-lobby-box {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: .8rem 1rem;
+  background: #14121d;
+}
+.room-lobby-box h3 { margin-top: 0; }
+.room-lobby-box .inline-form { align-items: center; }
+.room-lobby-box .inline-form input[type=text] { min-width: 10rem; }
+#room-code-display { font-size: 1rem; color: var(--amber); letter-spacing: .08rem; }
+#room-key-line { align-items: center; }
+#room-key-line code { user-select: all; }
+input:disabled, select:disabled, button:disabled { opacity: .45; cursor: not-allowed; }
+
 /* 版本合并 */
-.merge-side { font-size: .84rem; color: var(--text); min-width: 11rem; }
-.merge-conflict {
+.merge-side { font-size: .84rem; color: var(--text); min-width: 11rem; }.merge-conflict {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: .7rem .9rem;

@@ -11,6 +11,7 @@
     <h1>🎭 小剧场灯光 Cue 排演</h1>
     <nav class="tabs">
       <button class="tab active" data-tab="player">排演播放</button>
+      <button class="tab" data-tab="rooms">共享房间</button>
       <button class="tab" data-tab="records">调光记录</button>
       <button class="tab" data-tab="compare">版本比对</button>
       <button class="tab" data-tab="load">回路负载</button>
@@ -75,6 +76,107 @@
             </thead>
             <tbody></tbody>
           </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 共享房间 ============================ -->
+    <section id="tab-rooms" class="tab-panel">
+      <div class="card" id="room-lobby">
+        <h2>共享排演房间</h2>
+        <p class="muted">
+          基于一个<strong>已发布版本</strong>创建共享房间：创建者取得<strong>控制密钥</strong>，
+          其他人凭<strong>房间码</strong>观看同一舞台与逐灯亮度。房间固定创建时所选版本，
+          服务端按时间推算当前时码，到版本末尾自动停住；页面刷新、服务重启、观看者重连后都能恢复进度，
+          后续草稿修改与新版本发布不影响房间。只有持密钥者可以播放、暂停、跳转和切换 0.5×/1×/2× 速度。
+        </p>
+        <div class="room-lobby-cols">
+          <div class="room-lobby-box">
+            <h3>创建房间（你将成为控制者）</h3>
+            <form id="form-room-create" class="cue-form">
+              <label style="grid-column:1/-1">固定版本
+                <select id="room-version" required></select>
+              </label>
+              <label style="grid-column:1/-1">房间备注（可留空）
+                <input type="text" id="room-create-label" placeholder="如：周五技术联排" />
+              </label>
+              <button class="primary" type="submit">🎟 创建共享房间</button>
+            </form>
+            <div id="room-create-error" class="error-line" hidden></div>
+          </div>
+          <div class="room-lobby-box">
+            <h3>加入房间（凭房间码观看）</h3>
+            <form id="form-room-join" class="inline-form">
+              <input type="text" id="room-join-code" placeholder="6 位房间码，如 K7QH2M" maxlength="6"
+                style="text-transform:uppercase;letter-spacing:.15rem" />
+              <button class="primary" type="submit">🚪 加入观看</button>
+            </form>
+            <p class="muted">
+              如果你是创建者，可勾选「我是控制者」并填入控制密钥；密钥只保存在本浏览器地址与本地会话中。
+            </p>
+            <form id="form-room-host" class="inline-form" style="margin-top:.4rem">
+              <label class="speed"><input type="checkbox" id="room-join-host" /> 我是控制者</label>
+              <input type="text" id="room-join-key" placeholder="控制密钥（创建房间时返回）" disabled />
+            </form>
+            <div id="room-join-error" class="error-line" hidden></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="room-workspace" hidden>
+        <div class="player-controls card">
+          <div class="row">
+            <span id="room-badge" class="badge done">共享房间</span>
+            <b id="room-code-display"></b>
+            <span id="room-role" class="muted"></span>
+            <span id="room-sync" class="muted"></span>
+            <button id="btn-room-leave" style="margin-left:auto">离开房间</button>
+          </div>
+          <div class="row muted" id="room-meta"></div>
+          <div class="row transport">
+            <button id="btn-room-play" class="primary">▶ 播放</button>
+            <button id="btn-room-pause">⏸ 暂停</button>
+            <label class="speed">速度
+              <select id="room-speed">
+                <option value="0.5">0.5×</option>
+                <option value="1">1×</option>
+                <option value="2">2×</option>
+              </select>
+            </label>
+            <span class="time-readout"><b id="room-time-current">0.0</b> / <span id="room-time-total">0.0</span> s</span>
+            <label class="jump">跳转到
+              <input id="room-jump-time" type="number" min="0" step="0.1" style="width:5.5rem" /> 秒
+            </label>
+            <button id="btn-room-jump">跳转</button>
+            <span class="muted">修订号 <b id="room-revision">0</b></span>
+          </div>
+          <div class="row">
+            <input id="room-timeline" type="range" min="0" max="0" step="0.01" value="0" style="flex:1" />
+          </div>
+          <div id="room-error" class="error-line" hidden></div>
+          <div class="row" id="room-key-line" hidden></div>
+        </div>
+
+        <div class="card">
+          <h2>舞台模拟（房间当前各灯实际亮度）</h2>
+          <div id="room-stage" class="stage"></div>
+        </div>
+
+        <div class="card">
+          <h2>各灯亮度</h2>
+          <div id="room-levels" class="levels"></div>
+        </div>
+
+        <div class="card">
+          <h2>Cue 时间线</h2>
+          <div class="table-wrap">
+            <table id="room-cue-timeline">
+              <thead>
+                <tr><th>Cue 编号</th><th>灯具</th><th>触发 (s)</th><th>目标亮度</th><th>渐变 (s)</th><th>状态</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </section>

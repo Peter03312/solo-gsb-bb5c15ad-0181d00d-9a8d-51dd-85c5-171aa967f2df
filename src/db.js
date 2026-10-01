@@ -116,6 +116,23 @@ CREATE TABLE IF NOT EXISTS merge_previews (
   payload      TEXT NOT NULL,
   created_at   REAL NOT NULL
 );
+
+-- 共享排演房间：固定一个已发布版本，服务端按基准时码/墙上时钟推算当前进度。
+-- 房间码 code 用于加入观看，control_key 仅创建者持有（持密钥者可控制）。
+-- revision 为控制修订号：每次成功控制 +1，过期提交返回冲突且不改房间。
+CREATE TABLE IF NOT EXISTS rooms (
+  code         TEXT PRIMARY KEY,                  -- 6 位大写房间码（无易混字符）
+  control_key  TEXT NOT NULL UNIQUE,              -- 32 位十六进制控制密钥
+  version_id   INTEGER NOT NULL REFERENCES versions(id),
+  label        TEXT NOT NULL,
+  duration     REAL NOT NULL DEFAULT 0,           -- 固定版本的演出总时长（末条 Cue 渐变结束时刻）
+  playing      INTEGER NOT NULL DEFAULT 0,        -- 1 播放 / 0 暂停
+  anchor_time  REAL NOT NULL DEFAULT 0,           -- 基准时码（演出秒）
+  anchor_wall  REAL NOT NULL DEFAULT 0,           -- 基准时码对应的墙上时钟（Unix 秒，重启后可继续推算）
+  speed        REAL NOT NULL DEFAULT 1 CHECK (speed IN (0.5, 1, 2)),
+  revision     INTEGER NOT NULL DEFAULT 0,
+  created_at   REAL NOT NULL
+);
 `;
 
 let db;

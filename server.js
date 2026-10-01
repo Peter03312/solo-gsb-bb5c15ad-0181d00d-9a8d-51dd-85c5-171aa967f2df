@@ -6,6 +6,7 @@ const express = require('express');
 const { open, get } = require('./src/db');
 const Engine = require('./public/engine');
 const Merge = require('./src/merge');
+const Rooms = require('./src/rooms');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'app.db');
@@ -1374,6 +1375,210 @@ app.post('/api/merge/commit', (req, res) => {
   });
 });
 
+/* --------------------- 共享排演房间（创建 / 加入 / 控制） --------------------- */
+// 房间固定一个已发布版本：创建者取得控制密钥，其他人凭 6 位房间码观看同一舞台与逐灯亮度。
+// 房间保存播放状态、基准时码（anchor_time + anchor_wall）、速度与修订号；
+// 服务端按墙上时钟推算当前时码，到版本末尾自动停住（惰性落库）。
+// 页面刷新、服务重启、观看者重连均按基准恢复；后续草稿修改与新版本发布不影响已建房间。
+// 持密钥者可 play/pause/seek/speed；控制请求携带当前修订号，过期返回 409 且不改房间。
+// 房间操作只读版本快照，不改版本、草稿或调光记录。
+
+const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去掉易混的 I/O/0/1
+const ROOM_CODE_RE = /^[A-Z2-9]{6}$/;
+
+function generateRoomCode() {
+  const bytes = crypto.randomBytes(6);
+  let code = '';
+  for (let i = 0; i < 6; i++) code += ROOM_CODE_ALPHABET[bytes[i] % ROOM_CODE_ALPHABET.length];
+  return code;
+}
+
+// 房间对外视图：含当前推算时码与固定版本的灯具/Cue 快照（加入后前端本地按既有渐变规则渲染）
+function presentRoom(row, snap, now) {
+  const { time, ended } = Rooms.projectRoom(row, now);
+  return {
+    code: row.code,
+    label: row.label,
+    version: { id: snap.id, label: snap.label, cue_count: snap.cue_count },
+    lights: snap.lights,
+    cues: snap.cues,
+    duration: row.duration,
+    playing: row.playing === 1 && !ended, // 到末尾自动停住后即视为暂停
+    time: round6(time),
+    speed: row.speed,
+    revision: row.revision,
+    server_time: round6(now), // 服务端墙上时钟（Unix 秒），供观看端校时
+    ended,
+  };
+}
+
+/**
+ * 读取房间并做「到版本末尾自动停住」的惰性落库：
+ * 若按当前墙上时钟推算已到末尾而库里仍为播放，则把基准改写到末尾（暂停），
+ * 不改变修订号（自动停住不是一次人为控制）。
+ */
+function materializeRoom(row, now) {
+  if (row.playing !== 1) return row;
+  const { ended } = Rooms.projectRoom(row, now);
+  if (!ended) return row;
+  db.prepare(
+    'UPDATE rooms SET playing = 0, anchor_time = duration, anchor_wall = ? WHERE code = ?'
+  ).run(now, row.code);
+  return db.prepare('SELECT * FROM rooms WHERE code = ?').get(row.code);
+}
+
+// POST /api/rooms  基于已发布版本创建房间，创建者得到房间码与控制密钥（密钥仅本次返回）
+app.post('/api/rooms', (req, res) => {
+  const versionId = toPosInt(req.body?.version_id);
+  if (Number.isNaN(versionId)) {
+    return err(
+      res,
+      400,
+      `版本编号无效：${JSON.stringify(req.body?.version_id)}（房间只能基于已发布版本创建）`
+    );
+  }
+  const version = db.prepare('SELECT id FROM versions WHERE id = ?').get(versionId);
+  if (!version) return err(res, 404, `版本不存在：#${versionId}，无法基于它创建房间`);
+
+  const snap = loadVersionSnapshot(versionId);
+  const orderedCues = Engine.prepareCues(snap.cues);
+  const duration = Engine.showDuration(orderedCues);
+
+  const labelRaw = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
+  const label =
+    labelRaw ||
+    `共享房间 · ${snap.label} · ${new Date().toLocaleString('zh-CN', { hour12: false })}`;
+
+  const controlKey = crypto.randomBytes(16).toString('hex');
+  const now = Date.now() / 1000;
+
+  // 房间码极小概率撞号：碰撞后换一组重试，仍失败则报 503
+  const insert = db.prepare(
+    `INSERT INTO rooms
+       (code, control_key, version_id, label, duration, playing, anchor_time, anchor_wall, speed, revision, created_at)
+     VALUES (?, ?, ?, ?, ?, 0, 0, ?, 1, 0, ?)`
+  );
+  let code = null;
+  for (let attempt = 0; attempt < 10 && code === null; attempt++) {
+    const candidate = generateRoomCode();
+    try {
+      insert.run(candidate, controlKey, versionId, label, duration, now, now);
+      code = candidate;
+    } catch (e) {
+      if (!String(e.message).includes('UNIQUE')) throw e;
+    }
+  }
+  if (code === null) {
+    return err(res, 503, '房间码暂时分配失败，请稍后重试');
+  }
+
+  const row = db.prepare('SELECT * FROM rooms WHERE code = ?').get(code);
+  res.status(201).json({
+    ...presentRoom(row, snap, now),
+    // 控制密钥只在创建响应中返回一次；请创建者妥善保存
+    control_key: controlKey,
+  });
+});
+
+// GET /api/rooms/:code  凭房间码观看（可选 ?key= 校验自己是持密钥者）；返回当前房间状态与快照
+app.get('/api/rooms/:code', (req, res) => {
+  const codeRaw = String(req.params.code || '').trim().toUpperCase();
+  if (!ROOM_CODE_RE.test(codeRaw)) {
+    return err(res, 404, `房间码无效：${JSON.stringify(req.params.code)}（应为 6 位房间码）`);
+  }
+  let row = db.prepare('SELECT * FROM rooms WHERE code = ?').get(codeRaw);
+  if (!row) return err(res, 404, `房间不存在：房间码 ${codeRaw}`);
+
+  const now = Date.now() / 1000;
+  row = materializeRoom(row, now);
+
+  let host = false;
+  const keyParam = req.query.key;
+  if (keyParam !== undefined) {
+    if (typeof keyParam !== 'string' || keyParam.length === 0) {
+      return err(res, 400, '控制密钥 key 不能为空');
+    }
+    if (keyParam !== row.control_key) {
+      return err(res, 403, `控制密钥无效：房间 ${codeRaw} 拒绝以持密钥者身份访问`);
+    }
+    host = true;
+  }
+
+  const snap = loadVersionSnapshot(row.version_id);
+  res.json({ ...presentRoom(row, snap, now), host });
+});
+
+// POST /api/rooms/:code/control  持密钥者控制：play / pause / seek / speed
+app.post('/api/rooms/:code/control', (req, res) => {
+  const codeRaw = String(req.params.code || '').trim().toUpperCase();
+  if (!ROOM_CODE_RE.test(codeRaw)) {
+    return err(res, 404, `房间码无效：${JSON.stringify(req.params.code)}（应为 6 位房间码）`);
+  }
+
+  const key = req.body?.key;
+  if (typeof key !== 'string' || key.length === 0) {
+    return err(res, 400, '控制请求必须携带控制密钥 key');
+  }
+
+  if (req.body === null || typeof req.body !== 'object' || !('revision' in req.body)) {
+    return err(res, 400, '控制请求必须携带房间修订号 revision（与服务器当前修订号一致才生效）');
+  }
+  const clientRev = toNum(req.body.revision);
+  if (!Number.isInteger(clientRev) || clientRev < 0) {
+    return err(res, 400, `修订号无效：${JSON.stringify(req.body.revision)}（须为非负整数）`);
+  }
+
+  const action = req.body?.action;
+
+  try {
+    const now = Date.now() / 1000;
+
+    // 单事务：取房间（并先把到末尾自动停住落库）→ 校验密钥 → 校验修订号 → 校验动作 → 落库
+    const result = db.transaction(() => {
+      let row = db.prepare('SELECT * FROM rooms WHERE code = ?').get(codeRaw);
+      if (!row) {
+        throw new Rooms.RoomError(404, `房间不存在：房间码 ${codeRaw}`);
+      }
+      row = materializeRoom(row, now);
+
+      if (key !== row.control_key) {
+        throw new Rooms.RoomError(403, `控制密钥无效：仅持密钥者可控制房间 ${codeRaw}`);
+      }
+
+      if (clientRev !== row.revision) {
+        throw new Rooms.RoomError(
+          409,
+          `修订号冲突：提交基于修订号 ${clientRev}，房间当前已为修订号 ${row.revision}；` +
+            '请按服务器最新状态重试（本次未改变房间）'
+        );
+      }
+
+      const patch = Rooms.applyAction(row, action, req.body || {}, now);
+
+      // 事务内复查修订号（better-sqlite3 同步执行，此处为双保险）
+      const cur = db.prepare('SELECT revision FROM rooms WHERE code = ?').get(codeRaw);
+      if (cur.revision !== clientRev) {
+        throw new Rooms.RoomError(409, '修订号冲突：房间刚被他人控制，请刷新后重试（本次未改变房间）');
+      }
+
+      db.prepare(
+        `UPDATE rooms SET playing = ?, anchor_time = ?, anchor_wall = ?, speed = ?, revision = revision + 1
+         WHERE code = ?`
+      ).run(patch.playing, patch.anchor_time, patch.anchor_wall, patch.speed, codeRaw);
+
+      return db.prepare('SELECT * FROM rooms WHERE code = ?').get(codeRaw);
+    })();
+
+    const snap = loadVersionSnapshot(result.version_id);
+    res.status(200).json({ ...presentRoom(result, snap, Date.now() / 1000), host: true });
+  } catch (e) {
+    if (e instanceof Rooms.RoomError) {
+      return err(res, e.status, e.message);
+    }
+    throw e;
+  }
+});
+
 /* ------------------------------- 错误处理 ------------------------------ */
 
 // JSON 解析失败（如非法时码导致的畸形 JSON 之外的格式错误）
@@ -1385,12 +1590,20 @@ app.use((e, req, res, next) => {
   err(res, 500, '服务器内部错误');
 });
 
-// 前端单页回退（API 未命中返回 JSON 404）
+// API 未命中返回 JSON 404；其余非 /api 路径回退到前端单页
+app.use('/api', (req, res) => {
+  err(res, 404, `接口不存在：${req.method} ${req.originalUrl}`);
+});
 app.get(/^(?!\/api\/).*/, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`小剧场灯光 Cue 排演应用已启动: http://localhost:${PORT}`);
-  console.log(`数据库: ${DB_PATH}`);
-});
+// 直接运行（node server.js）时启动 HTTP 服务；被测试 require 时不占用端口
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`小剧场灯光 Cue 排演应用已启动: http://localhost:${PORT}`);
+    console.log(`数据库: ${DB_PATH}`);
+  });
+}
+
+module.exports = { app, PORT };
